@@ -20,11 +20,13 @@ struct ChatMessage: Identifiable, Hashable, Codable { // Made Codable for persis
     let id: UUID
     let sender: Sender
     let text: String
+    let timestamp: Date
     
-    init(id: UUID = UUID(), sender: Sender, text: String) {
+    init(id: UUID = UUID(), sender: Sender, text: String, timestamp: Date = Date()) {
         self.id = id
         self.sender = sender
         self.text = text
+        self.timestamp = timestamp
     }
 }
 
@@ -44,19 +46,41 @@ class ChatViewModel {
     
     private var session: LanguageModelSession? = nil
     
+    // Callback for when a new AI message is added
+    var onNewAIMessage: ((String) -> Void)?
+    
     init() {
+        print("🔄 Initializing ChatViewModel...")
+        
+        // Add a welcome message first
+        addAIMessage("Hello! I'm your AI assistant. Initializing...")
+        
         // Setup LLM session with helpful assistant instructions
         let instructions = """
         You are a helpful, friendly chat assistant. Keep your answers concise and use natural conversational language. If you don't know, say so politely.
         """
         
-        do {
-            session = LanguageModelSession(instructions: instructions)
-            print("✅ LanguageModelSession created successfully")
-        } catch {
-            print("❌ Failed to create LanguageModelSession: \(error)")
-            // Add a welcome message to indicate the app is working
-            messages.append(ChatMessage(sender: .llm, text: "Hello! I'm your AI assistant. The language model is initializing..."))
+        // Try to create session with better error handling
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            do {
+                self.session = LanguageModelSession(instructions: instructions)
+                print("✅ LanguageModelSession created successfully")
+                
+                        // Update the welcome message
+                        if let lastMessageIndex = self.messages.firstIndex(where: { $0.sender == .llm && $0.text.contains("Initializing") }) {
+                            self.messages[lastMessageIndex] = ChatMessage(sender: .llm, text: "Hello! I'm your AI assistant. Ready to chat!")
+                            self.onNewAIMessage?("Hello! I'm your AI assistant. Ready to chat!")
+                        }
+            } catch {
+                print("❌ Failed to create LanguageModelSession: \(error)")
+                print("❌ Error details: \(error.localizedDescription)")
+                
+                        // Update the welcome message to indicate the issue
+                        if let lastMessageIndex = self.messages.firstIndex(where: { $0.sender == .llm && $0.text.contains("Initializing") }) {
+                            self.messages[lastMessageIndex] = ChatMessage(sender: .llm, text: "Hello! I'm your AI assistant. Note: Language model is not available, but you can still use the chat interface.")
+                            self.onNewAIMessage?("Hello! I'm your AI assistant. Note: Language model is not available, but you can still use the chat interface.")
+                        }
+            }
         }
         
         // Load messages from persistent storage
@@ -91,7 +115,7 @@ class ChatViewModel {
         guard !prompt.isEmpty else { return }
         
         if session == nil {
-            messages.append(ChatMessage(sender: .llm, text: "Sorry, the language model is not available. Please check that you're running macOS 26 beta and that FoundationModels is properly installed."))
+            addAIMessage("Sorry, the language model is not available. Please check that you're running macOS 26 beta and that FoundationModels is properly installed.")
             return
         }
         
@@ -103,13 +127,26 @@ class ChatViewModel {
             print("🤖 Sending prompt to LanguageModelSession: \(prompt)")
             let response = try await session!.respond(to: prompt)
             print("✅ Received response: \(response.content)")
-            messages.append(ChatMessage(sender: .llm, text: response.content))
+            addAIMessage(response.content)
         } catch {
             print("❌ Error getting response: \(error)")
-            messages.append(ChatMessage(sender: .llm, text: "Sorry, I encountered an error: \(error.localizedDescription)"))
+            addAIMessage("Sorry, I encountered an error: \(error.localizedDescription)")
         }
         isResponding = false
     }
+    
+    /// Clears all chat messages
+    func clearChat() {
+        messages.removeAll()
+        userInput = ""
+    }
+    
+    /// Adds an AI message and triggers TTS callback
+    private func addAIMessage(_ text: String) {
+        messages.append(ChatMessage(sender: .llm, text: text))
+        onNewAIMessage?(text)
+    }
+    
 }
 
 /// SpeechRecognizer helper class to manage speech recognition lifecycle
@@ -186,6 +223,76 @@ final class SpeechRecognizer: NSObject, ObservableObject {
     }
 }
 
+/// Text-to-Speech manager for speaking AI responses
+final class TextToSpeechManager: NSObject, ObservableObject {
+    @Published var isSpeaking = false
+    @Published var isEnabled = true
+    
+    private let synthesizer = AVSpeechSynthesizer()
+    
+    override init() {
+        super.init()
+        synthesizer.delegate = self
+    }
+    
+    /// Speaks the given text
+    func speak(_ text: String) {
+        guard isEnabled && !text.isEmpty else { return }
+        
+        // Stop any current speech
+        stopSpeaking()
+        
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate * 0.9 // Slightly slower for better comprehension
+        utterance.volume = 0.8
+        utterance.pitchMultiplier = 1.0
+        
+        // Try to use a pleasant voice
+        if let voice = AVSpeechSynthesisVoice(language: "en-US") {
+            utterance.voice = voice
+        }
+        
+        synthesizer.speak(utterance)
+    }
+    
+    /// Stops current speech
+    func stopSpeaking() {
+        if synthesizer.isSpeaking {
+            synthesizer.stopSpeaking(at: .immediate)
+        }
+    }
+    
+    /// Toggles TTS on/off
+    func toggleEnabled() {
+        isEnabled.toggle()
+        if !isEnabled {
+            stopSpeaking()
+        }
+    }
+}
+
+// MARK: - AVSpeechSynthesizerDelegate
+extension TextToSpeechManager: AVSpeechSynthesizerDelegate {
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        DispatchQueue.main.async {
+            self.isSpeaking = true
+        }
+    }
+    
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        DispatchQueue.main.async {
+            self.isSpeaking = false
+        }
+    }
+    
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        DispatchQueue.main.async {
+            self.isSpeaking = false
+        }
+    }
+}
+
+
 struct ContentView: View {
     // MARK: Stored messages in AppStorage as Data
     @AppStorage("chatMessages") private var storedMessages: Data = Data() // Used only for persistence sync
@@ -197,6 +304,9 @@ struct ContentView: View {
     // MARK: Speech recognition states
     @State private var speechRecognizer: SpeechRecognizer?
     @State private var speechInputActive = false
+    
+    // MARK: Text-to-Speech states
+    @StateObject private var ttsManager = TextToSpeechManager()
     
     var body: some View {
         VStack(spacing: 16) {
@@ -266,6 +376,48 @@ struct ContentView: View {
                     .lineLimit(1...6)
                     .disabled(viewModel.isResponding)
                     .padding(.vertical, 8)
+                    .onSubmit {
+                        if !viewModel.userInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !viewModel.isResponding {
+                            Task { await viewModel.sendMessage() }
+                        }
+                    }
+                
+                
+                // Clear chat button
+                Button {
+                    viewModel.clearChat()
+                } label: {
+                    Image(systemName: "trash.circle")
+                        .font(.system(size: 24))
+                        .tint(.secondary)
+                }
+                .disabled(viewModel.messages.isEmpty || viewModel.isResponding)
+                .buttonStyle(PlainButtonStyle())
+                .help("Clear chat history")
+                
+                // TTS toggle button
+                Button {
+                    ttsManager.toggleEnabled()
+                } label: {
+                    Image(systemName: ttsManager.isEnabled ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                        .font(.system(size: 24))
+                        .tint(ttsManager.isEnabled ? .accentColor : .secondary)
+                }
+                .buttonStyle(PlainButtonStyle())
+                .help(ttsManager.isEnabled ? "Text-to-Speech enabled" : "Text-to-Speech disabled")
+                
+                // Stop TTS button (only show when speaking)
+                if ttsManager.isSpeaking {
+                    Button {
+                        ttsManager.stopSpeaking()
+                    } label: {
+                        Image(systemName: "stop.circle.fill")
+                            .font(.system(size: 24))
+                            .tint(.red)
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                    .help("Stop speaking")
+                }
                 
                 Button {
                     Task { await viewModel.sendMessage() }
@@ -318,6 +470,11 @@ struct ContentView: View {
                 requestMicrophonePermission()
                 #endif
             }
+            
+            // Set up TTS callback for AI messages
+            viewModel.onNewAIMessage = { [weak ttsManager] message in
+                ttsManager?.speak(message)
+            }
         }
     }
     
@@ -341,34 +498,46 @@ struct ChatBubble: View {
     var body: some View {
         HStack {
             if isFromUser { Spacer() }
-            Text(message.text)
-                .padding(14)
-                .foregroundStyle(isFromUser ? Color.white : Color.primary)
-                .background(
-                    Group {
-                        if isFromUser {
-                            // User bubble: accent gradient with shadow
-                            LinearGradient(
-                                gradient: Gradient(colors: [Color.accentColor.opacity(0.85), Color.accentColor]),
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        } else {
-                            // LLM bubble: dark background with subtle border
-                            Color(white: 0.15)
-                        }
+            VStack(alignment: isFromUser ? .trailing : .leading, spacing: 4) {
+                Text(message.text)
+                    .foregroundStyle(isFromUser ? Color.white : Color.primary)
+                
+                Text(formatTimestamp(message.timestamp))
+                    .font(.caption2)
+                    .foregroundStyle(isFromUser ? Color.white.opacity(0.7) : Color.secondary)
+            }
+            .padding(14)
+            .background(
+                Group {
+                    if isFromUser {
+                        // User bubble: accent gradient with shadow
+                        LinearGradient(
+                            gradient: Gradient(colors: [Color.accentColor.opacity(0.85), Color.accentColor]),
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    } else {
+                        // LLM bubble: dark background with subtle border
+                        Color(white: 0.15)
                     }
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .stroke(isFromUser ? Color.accentColor.opacity(0.8) : Color.white.opacity(0.12), lineWidth: 1)
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-                .shadow(color: isFromUser ? Color.accentColor.opacity(0.4) : Color.black.opacity(0.3), radius: 3, x: 0, y: 2)
-                .frame(maxWidth: 320, alignment: isFromUser ? .trailing : .leading)
+                }
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .stroke(isFromUser ? Color.accentColor.opacity(0.8) : Color.white.opacity(0.12), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .shadow(color: isFromUser ? Color.accentColor.opacity(0.4) : Color.black.opacity(0.3), radius: 3, x: 0, y: 2)
+            .frame(maxWidth: 320, alignment: isFromUser ? .trailing : .leading)
             if !isFromUser { Spacer() }
         }
         .padding(.horizontal, 6)
+    }
+    
+    private func formatTimestamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
     }
 }
 
